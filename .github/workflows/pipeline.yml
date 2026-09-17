@@ -1,0 +1,527 @@
+name: Tourism Project MLOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+
+  # ============================================================
+  # 1. DATA REGISTRATION
+  # ============================================================
+  data-registration:
+    name: Data Registration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-github-actions.txt
+
+      - name: Register Dataset on Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          token = os.environ["HF_TOKEN"]
+
+          api = HfApi(token=token)
+
+          repo_id = "Muleex12/tourism-package-prediction-data"
+
+          # Upload the original dataset to the Hugging Face Dataset Hub
+          api.upload_file(
+              path_or_fileobj="data/tourism.csv",
+              path_in_repo="tourism.csv",
+              repo_id=repo_id,
+              repo_type="dataset"
+          )
+
+          print("✓ Original tourism dataset registered on Hugging Face.")
+          print(f"✓ Dataset repository: {repo_id}")
+          PY
+
+
+  # ============================================================
+  # 2. DATA PREPARATION
+  # ============================================================
+  data-preparation:
+    name: Data Preparation
+    needs: data-registration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-github-actions.txt
+
+      - name: Prepare Data
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from sklearn.model_selection import train_test_split
+          from huggingface_hub import HfApi
+
+          token = os.environ["HF_TOKEN"]
+
+          data_url = (
+              "https://huggingface.co/datasets/"
+              "Muleex12/tourism-package-prediction-data/"
+              "resolve/main/tourism.csv"
+          )
+
+          # Load data directly from Hugging Face
+          df = pd.read_csv(data_url)
+
+          print("Original dataset shape:", df.shape)
+
+          # Remove unnecessary columns
+          df = df.drop(
+              columns=["Unnamed: 0", "CustomerID"],
+              errors="ignore"
+          )
+
+          # Remove duplicate records
+          df = df.drop_duplicates().reset_index(drop=True)
+
+          print("Cleaned dataset shape:", df.shape)
+
+          # Separate features and target
+          X = df.drop(columns=["ProdTaken"])
+          y = df["ProdTaken"]
+
+          # Stratified 80/20 train-test split
+          X_train, X_test, y_train, y_test = train_test_split(
+              X,
+              y,
+              test_size=0.20,
+              random_state=42,
+              stratify=y
+          )
+
+          train_df = X_train.copy()
+          train_df["ProdTaken"] = y_train.values
+
+          test_df = X_test.copy()
+          test_df["ProdTaken"] = y_test.values
+
+          os.makedirs("data", exist_ok=True)
+
+          train_df.to_csv(
+              "data/train.csv",
+              index=False
+          )
+
+          test_df.to_csv(
+              "data/test.csv",
+              index=False
+          )
+
+          print("Training data shape:", train_df.shape)
+          print("Testing data shape:", test_df.shape)
+
+          # Upload train and test datasets to Hugging Face
+          api = HfApi(token=token)
+
+          repo_id = "Muleex12/tourism-package-prediction-data"
+
+          api.upload_file(
+              path_or_fileobj="data/train.csv",
+              path_in_repo="train.csv",
+              repo_id=repo_id,
+              repo_type="dataset"
+          )
+
+          api.upload_file(
+              path_or_fileobj="data/test.csv",
+              path_in_repo="test.csv",
+              repo_id=repo_id,
+              repo_type="dataset"
+          )
+
+          print("✓ Train and test datasets uploaded to Hugging Face.")
+          PY
+
+
+  # ============================================================
+  # 3. MODEL TRAINING + EXPERIMENT TRACKING
+  # ============================================================
+  model-training:
+    name: Model Training and Experiment Tracking
+    needs: data-preparation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-github-actions.txt
+
+      - name: Train, Tune and Track Model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import joblib
+          import mlflow
+          import pandas as pd
+
+          from sklearn.compose import ColumnTransformer
+          from sklearn.preprocessing import OneHotEncoder
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.pipeline import Pipeline
+          from sklearn.model_selection import GridSearchCV
+          from sklearn.metrics import (
+              accuracy_score,
+              precision_score,
+              recall_score,
+              f1_score
+          )
+
+          from huggingface_hub import HfApi
+
+          token = os.environ["HF_TOKEN"]
+
+          # ----------------------------------------------------
+          # Load train and test data directly from Hugging Face
+          # ----------------------------------------------------
+
+          train_url = (
+              "https://huggingface.co/datasets/"
+              "Muleex12/tourism-package-prediction-data/"
+              "resolve/main/train.csv"
+          )
+
+          test_url = (
+              "https://huggingface.co/datasets/"
+              "Muleex12/tourism-package-prediction-data/"
+              "resolve/main/test.csv"
+          )
+
+          train_df = pd.read_csv(train_url)
+          test_df = pd.read_csv(test_url)
+
+          X_train = train_df.drop(columns=["ProdTaken"])
+          y_train = train_df["ProdTaken"]
+
+          X_test = test_df.drop(columns=["ProdTaken"])
+          y_test = test_df["ProdTaken"]
+
+          print("Training data:", train_df.shape)
+          print("Testing data:", test_df.shape)
+
+          # ----------------------------------------------------
+          # Identify feature types
+          # ----------------------------------------------------
+
+          numerical_features = X_train.select_dtypes(
+              include=["int64", "float64"]
+          ).columns.tolist()
+
+          categorical_features = X_train.select_dtypes(
+              include=["object"]
+          ).columns.tolist()
+
+          # ----------------------------------------------------
+          # Preprocessing
+          # ----------------------------------------------------
+
+          preprocessor = ColumnTransformer(
+              transformers=[
+                  (
+                      "num",
+                      "passthrough",
+                      numerical_features
+                  ),
+                  (
+                      "cat",
+                      OneHotEncoder(handle_unknown="ignore"),
+                      categorical_features
+                  )
+              ]
+          )
+
+          # ----------------------------------------------------
+          # Random Forest model
+          # ----------------------------------------------------
+
+          model = RandomForestClassifier(
+              class_weight="balanced",
+              random_state=42,
+              n_jobs=-1
+          )
+
+          pipeline = Pipeline(
+              steps=[
+                  ("preprocessor", preprocessor),
+                  ("model", model)
+              ]
+          )
+
+          # ----------------------------------------------------
+          # Hyperparameter tuning
+          # ----------------------------------------------------
+
+          param_grid = {
+              "model__n_estimators": [100, 200, 300],
+              "model__max_depth": [None, 10, 20],
+              "model__min_samples_split": [2, 5],
+              "model__min_samples_leaf": [1, 2]
+          }
+
+          grid_search = GridSearchCV(
+              estimator=pipeline,
+              param_grid=param_grid,
+              scoring="f1",
+              cv=5,
+              n_jobs=-1
+          )
+
+          # ----------------------------------------------------
+          # MLflow experiment tracking
+          # ----------------------------------------------------
+
+          mlflow.set_tracking_uri(
+              "sqlite:///mlflow.db"
+          )
+
+          mlflow.set_experiment(
+              "Tourism Package Prediction"
+          )
+
+          with mlflow.start_run(
+              run_name="Random Forest GridSearch"
+          ):
+
+              grid_search.fit(
+                  X_train,
+                  y_train
+              )
+
+              best_model = grid_search.best_estimator_
+
+              predictions = best_model.predict(X_test)
+
+              accuracy = accuracy_score(
+                  y_test,
+                  predictions
+              )
+
+              precision = precision_score(
+                  y_test,
+                  predictions,
+                  zero_division=0
+              )
+
+              recall = recall_score(
+                  y_test,
+                  predictions,
+                  zero_division=0
+              )
+
+              f1 = f1_score(
+                  y_test,
+                  predictions,
+                  zero_division=0
+              )
+
+              best_params = grid_search.best_params_
+
+              cv_f1 = grid_search.best_score_
+
+              print("\nBest Parameters:")
+              print(best_params)
+
+              print("\nCross-validation F1:")
+              print(cv_f1)
+
+              print("\nTest Performance:")
+              print("Accuracy:", accuracy)
+              print("Precision:", precision)
+              print("Recall:", recall)
+              print("F1 Score:", f1)
+
+              # Log tuned parameters
+              mlflow.log_params({
+                  "n_estimators": best_params[
+                      "model__n_estimators"
+                  ],
+                  "max_depth": str(
+                      best_params["model__max_depth"]
+                  ),
+                  "min_samples_split": best_params[
+                      "model__min_samples_split"
+                  ],
+                  "min_samples_leaf": best_params[
+                      "model__min_samples_leaf"
+                  ],
+                  "class_weight": "balanced",
+                  "random_state": 42,
+                  "cv_folds": 5,
+                  "scoring": "f1"
+              })
+
+              # Log performance metrics
+              mlflow.log_metrics({
+                  "cv_f1": cv_f1,
+                  "test_accuracy": accuracy,
+                  "test_precision": precision,
+                  "test_recall": recall,
+                  "test_f1": f1
+              })
+
+              mlflow.set_tag(
+                  "model_type",
+                  "RandomForestClassifier"
+              )
+
+              mlflow.set_tag(
+                  "project",
+                  "Tourism Package Prediction"
+              )
+
+              print(
+                  "\n✓ MLflow parameters and metrics logged."
+              )
+
+          # ----------------------------------------------------
+          # Save final model and preprocessor
+          # ----------------------------------------------------
+
+          os.makedirs("model", exist_ok=True)
+
+          joblib.dump(
+              best_model.named_steps["model"],
+              "model/final_random_forest_model.pkl"
+          )
+
+          joblib.dump(
+              best_model.named_steps["preprocessor"],
+              "model/preprocessor.pkl"
+          )
+
+          # ----------------------------------------------------
+          # Upload model artifacts to Hugging Face Model Hub
+          # ----------------------------------------------------
+
+          api = HfApi(token=token)
+
+          model_repo = (
+              "Muleex12/tourism-package-prediction-model"
+          )
+
+          api.upload_file(
+              path_or_fileobj=(
+                  "model/final_random_forest_model.pkl"
+              ),
+              path_in_repo="final_random_forest_model.pkl",
+              repo_id=model_repo,
+              repo_type="model"
+          )
+
+          api.upload_file(
+              path_or_fileobj="model/preprocessor.pkl",
+              path_in_repo="preprocessor.pkl",
+              repo_id=model_repo,
+              repo_type="model"
+          )
+
+          print(
+              "\n✓ Best model uploaded to Hugging Face Model Hub."
+          )
+          PY
+
+      - name: Save MLflow Database as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-experiment-tracking
+          path: mlflow.db
+
+
+  # ============================================================
+  # 4. STREAMLIT DEPLOYMENT
+  # ============================================================
+  deploy:
+    name: Deploy Streamlit Application
+    needs: model-training
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Hugging Face Hub
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub
+
+      - name: Push Deployment Files to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          token = os.environ["HF_TOKEN"]
+
+          api = HfApi(token=token)
+
+          space_repo = (
+              "Muleex12/tourism-package-prediction-app"
+          )
+
+          api.upload_folder(
+              folder_path="deployment",
+              repo_id=space_repo,
+              repo_type="space"
+          )
+
+          print(
+              "✓ Deployment files uploaded to Hugging Face Space."
+          )
+          print(f"✓ Space: {space_repo}")
+          PY

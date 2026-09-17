@@ -1,0 +1,6 @@
+Tourism Package Prediction MLOps Pipeline
+Pipeline execution completed successfully.
+Data registration: completed
+Data preparation: completed
+Model training and MLflow tracking: completed
+Streamlit deployment: completed
